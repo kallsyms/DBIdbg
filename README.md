@@ -9,3 +9,10 @@ To speed up the debugging process (especially debugging black-box/RE) by allowin
 
 * Count the number of times this tight loop is run
 * Break whenever a string with the contents "AAAA" is loaded into rdi
+
+
+### Why Rust?
+
+I wanted to learn rust.
+Also to remove core debugger stuff as a potential source of errors/crashes.
+There's going to be enough memory-unsafe stuff happening already, I don't want parts of the debugger to potentially add to the mess.
