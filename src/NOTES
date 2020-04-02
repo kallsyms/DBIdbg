@@ -1,0 +1,30 @@
+linear disassembly, directly lifts as much code as possible
+2 exceptions:
+    * memory accesses
+        * rewrite to use our own memory regions
+        * attempt to keep code and data close so addresses can be directly rewritten
+        * in case of self-modifying/introspecting code:
+            * SMC:
+                * indirect writes to an addr in an already decoded BB invalidate the BB
+                    * JIT:
+                        * stack swap to an addr "hidden" through gs:
+                            * normal accesses to gs: are rewritten to do segment arithmatic inline on our own mappings
+                        * call to function to walk BBs
+                * writes then just go through to internal memory mappings
+            * SIC:
+                * reads go through internal mappings
+    * jumps
+        * (un)conditional branches are just rewritten to directly jump to the translated target
+            * in case of a back edge, this splits the BB
+        * indirect branches do the stack gs: swap trick (see above) then call to check if this is a known BB
+            * if so, swap stack back and go there
+            * if unknown, translate, swap stack, and go there
+            * if known but invalidated (from SMC), re-decode from our memory maps and jump there
+
+while decoding for above, any desired debugging, instrumentation, etc. can be JIT'd inline
+    * fast counts of events
+    * dumping args
+
+these can directly write to "host" memory so don't need to trap out to write values
+can sit on arbitrary conditions, even things like "break on all ____ instructions"
+could also be used to enforce CFI and similar?
