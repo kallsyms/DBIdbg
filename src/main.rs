@@ -249,7 +249,7 @@ impl<'a> TranslatorState<'a> {
 }
 
 fn main() {
-    let args = clap::App::new("LinDBG")
+    let args = clap::App::new("DBIdbg")
         .version("0.0.0")
         .author("Nick Gregory <kallsyms>")
         .about("Fast, programmable Linux debugger")

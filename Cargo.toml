@@ -1,5 +1,5 @@
 [package]
-name = "lindbg"
+name = "DBIdbg"
 version = "0.1.0"
 authors = ["Nick Gregory <computerfreak97@gmail.com>"]
 edition = "2018"
