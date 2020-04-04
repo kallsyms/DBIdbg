@@ -8,6 +8,6 @@ edition = "2018"
 
 [dependencies]
 clap = "2.33.0"
-elf = "0.0.10"
+xmas-elf = "0.7.0"
 iced-x86 = "1.0.1"
 mmap = "0.1.1"

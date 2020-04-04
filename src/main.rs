@@ -8,38 +8,26 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use iced_x86::{Decoder, DecoderOptions, BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock, OpKind, FlowControl};
 
-struct Allocator {
-    code_pages: mmap::MemoryMap,
+struct CodeRegionAllocator {
+    _code_pages: mmap::MemoryMap,
     next_code_addr: u64,
-
-    data_pages: mmap::MemoryMap,
-    next_data_addr: u64,
 }
 
-impl Allocator {
+impl CodeRegionAllocator {
     const LOCAL_MAX_SIZE: usize = 0x4000_0000; // half of signed int32 max
     const ADDR_BASE: u64 = 0x1_0000_0000;
 
-    fn new() -> Allocator {
-        let code_pages = mmap::MemoryMap::new(Allocator::LOCAL_MAX_SIZE, &[
+    fn new() -> CodeRegionAllocator {
+        let code_pages = mmap::MemoryMap::new(CodeRegionAllocator::LOCAL_MAX_SIZE, &[
             mmap::MapOption::MapReadable,
             mmap::MapOption::MapWritable,
             mmap::MapOption::MapExecutable,
-            mmap::MapOption::MapAddr(Allocator::ADDR_BASE as *const u8),
+            mmap::MapOption::MapAddr(CodeRegionAllocator::ADDR_BASE as *const u8),
         ]).unwrap();
 
-        let data_pages = mmap::MemoryMap::new(Allocator::LOCAL_MAX_SIZE, &[
-            mmap::MapOption::MapReadable,
-            mmap::MapOption::MapWritable,
-            mmap::MapOption::MapExecutable,
-            mmap::MapOption::MapAddr((Allocator::ADDR_BASE + Allocator::LOCAL_MAX_SIZE as u64) as *const u8),
-        ]).unwrap();
-
-        Allocator{
+        CodeRegionAllocator{
             next_code_addr: code_pages.data() as u64,
-            code_pages: code_pages,
-            next_data_addr: data_pages.data() as u64,
-            data_pages: data_pages,
+            _code_pages: code_pages,
         }
     }
 
@@ -68,44 +56,100 @@ impl BasicBlock {
     }
 }
 
-struct TranslatorState <'a> {
-    file: &'a elf::File,
+struct TranslatorState<'a> {
+    binary: xmas_elf::ElfFile<'a>,
 
     bitness: u32,
 
     // quick reference to the text section
-    text_section: &'a elf::Section,
+    text_section: xmas_elf::sections::SectionHeader<'a>,
 
-    allocator: Allocator,
+    side_stack: mmap::MemoryMap,
 
-    // map of program vaddr to backing memory
-    page_map: HashMap<u64, [u8; 4096]>,
+    mapped_regions: Vec<mmap::MemoryMap>,
+
+    allocator: CodeRegionAllocator,
 
     // map of program vaddr to JIT'd bb
     decoded_bbs: HashMap<u64, BasicBlock>,
 }
 
 impl<'a> TranslatorState<'a> {
-    fn new(file: &'a elf::File) -> TranslatorState<'a> {
-        let bitness = match file.ehdr.class {
-            elf::types::ELFCLASS32 => 32,
-            elf::types::ELFCLASS64 => 64,
-            _ => panic!("Invalid ELF bitness"),
+    fn new(contents: &'a Vec<u8>) -> Result<TranslatorState<'a>, &'static str> {
+        let binary = match xmas_elf::ElfFile::new(contents) {
+            Ok(b) => b,
+            Err(_) => return Err("Failed to load ELF"),
         };
 
-        let text_section = match file.get_section(".text") {
+        let bitness = match binary.header.pt1.class.as_class() {
+            xmas_elf::header::Class::ThirtyTwo => 32,
+            xmas_elf::header::Class::SixtyFour => 64,
+            _ => return Err("Invalid ELF class (bitness)"),
+        };
+
+        let text_section = match binary.find_section_by_name(".text") {
             Some(s) => s,
-            None => panic!("Failed to look up .text section"),
+            None => return Err("Failed to look up .text section"),
         };
 
-        TranslatorState {
-            file,
+        let side_stack = mmap::MemoryMap::new(0x10000, &[
+            mmap::MapOption::MapReadable,
+            mmap::MapOption::MapWritable,
+        ]).unwrap();
+
+        return Ok(TranslatorState {
+            binary,
             bitness,
             text_section,
-            allocator: Allocator::new(),
-            page_map: HashMap::new(),
+            side_stack,
+            mapped_regions: Vec::new(),
+            allocator: CodeRegionAllocator::new(),
             decoded_bbs: HashMap::new(),
+        });
+    }
+
+    fn map_file(&mut self) -> Result<(), mmap::MapError> {
+        for segment in self.binary.program_iter() {
+            match segment.get_type() {
+                Ok(xmas_elf::program::Type::Load) => (),
+                _ => continue,
+            }
+
+            let map_addr = segment.virtual_addr() & !(segment.align() - 1);
+            let mut map_ops = vec![
+                mmap::MapOption::MapWritable,  // everything needs to be writable so we can copy data in
+                mmap::MapOption::MapAddr(map_addr as *const u8),
+            ];
+
+            if segment.flags().is_read() {
+                map_ops.push(mmap::MapOption::MapReadable);
+            }
+            if segment.flags().is_execute() {
+                map_ops.push(mmap::MapOption::MapExecutable);
+            }
+
+            let alloc_result = mmap::MemoryMap::new(segment.mem_size() as usize, &map_ops);
+            if alloc_result.is_err() {
+                return Err(alloc_result.err().unwrap());
+            }
+
+            let allocation = alloc_result.unwrap();
+
+            let bin_data = match segment {
+                xmas_elf::program::ProgramHeader::Ph32(seg32) => seg32.raw_data(&self.binary),
+                xmas_elf::program::ProgramHeader::Ph64(seg64) => seg64.raw_data(&self.binary),
+            };
+
+            let data_offset = segment.virtual_addr() - map_addr;
+
+            unsafe {
+                allocation.data().offset(data_offset as isize).copy_from(bin_data.as_ptr(), bin_data.len());
+            }
+
+            self.mapped_regions.push(allocation);
         }
+
+        return Ok(());
     }
 
     fn is_decoded(&self, address: u64) -> bool {
@@ -133,14 +177,16 @@ impl<'a> TranslatorState<'a> {
 
         let split_offset = (pre_bb.source_address - split_address) as usize;
         let pre_bb_fallthrough_pc = pre_bb.jit_address + split_offset as u64;
-        let pre_bb_jit = pre_bb.jit_address;
 
         pre_bb.size = split_offset;
         let fallthrough_jump = self.encode_instrs(InstructionBlock::new(
             &[Instruction::with_branch(iced_x86::Code::Jmp_rel32_64, new_target_addr)],
             pre_bb_fallthrough_pc,
         ));
-        unsafe { (pre_bb_jit as *mut u8).copy_from(fallthrough_jump.as_ptr(), fallthrough_jump.len()); }
+
+        unsafe {
+            (pre_bb_fallthrough_pc as *mut u8).copy_from(fallthrough_jump.as_ptr(), fallthrough_jump.len());
+        }
 
         return self.decoded_bbs.get(&split_address).unwrap();
     }
@@ -201,14 +247,18 @@ impl<'a> TranslatorState<'a> {
     }
 
     fn decode_at(&mut self, address: u64) -> &BasicBlock {
-        let mut decoder = Decoder::new(self.bitness, &self.text_section.data, DecoderOptions::NONE);
-        decoder.set_position((address - self.text_section.shdr.addr) as usize);
+        let text: &[u8] = unsafe { std::slice::from_raw_parts(self.text_section.address() as *const u8, self.text_section.size() as usize) };
+        let mut decoder = Decoder::new(self.bitness, text, DecoderOptions::NONE);
+        decoder.set_position((address - self.text_section.address()) as usize);
         decoder.set_ip(address);
 
         let mut bb_instrs: Vec<Instruction> = Vec::new();
 
         loop {
             let instr = decoder.decode();
+            if decoder.invalid_no_more_bytes() {
+                break;
+            }
 
             // If we've decoded down into an existing BB, setup a trampoline to it
             // and break out
@@ -221,7 +271,7 @@ impl<'a> TranslatorState<'a> {
 
             bb_instrs.extend(rewritten_instrs);
 
-            if instr.flow_control() != FlowControl::Next {
+            if instr.flow_control() != FlowControl::Next && instr.code() != iced_x86::Code::Syscall {
                 // This is the end of the BB
                 break;
             }
@@ -232,7 +282,10 @@ impl<'a> TranslatorState<'a> {
             address,
         ));
         let new_code_region = self.allocator.alloc_code(rewritten_bytes.len());
-        unsafe { new_code_region.copy_from(rewritten_bytes.as_ptr(), rewritten_bytes.len()); }
+
+        unsafe {
+            new_code_region.copy_from(rewritten_bytes.as_ptr(), rewritten_bytes.len());
+        }
 
         let bb = BasicBlock{
             source_address: address,
@@ -244,7 +297,7 @@ impl<'a> TranslatorState<'a> {
     }
 
     fn decode_start(&mut self) -> &BasicBlock {
-        return self.decode_at(self.file.ehdr.entry);
+        return self.decode_at(self.binary.header.pt2.entry_point());
     }
 }
 
@@ -260,14 +313,14 @@ fn main() {
         .get_matches();
 
     let bin_path = PathBuf::from(args.value_of("file").unwrap());
+    let contents = std::fs::read(bin_path).expect("Unable to read file");
 
+    let mut translator: TranslatorState = TranslatorState::new(&contents).unwrap();
+    let map_result = translator.map_file();
+    if map_result.is_err() {
+        panic!(map_result.err().unwrap());
+    }
 
-    let file = match elf::File::open_path(&bin_path) {
-        Ok(f) => f,
-        Err(e) => panic!("Error: {:?}", e),
-    };
-
-    let mut translator: TranslatorState = TranslatorState::new(&file);
     let start_bb = translator.decode_start();
     start_bb.call();
 }
